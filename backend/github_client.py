@@ -5,39 +5,86 @@ from typing import Optional
 import requests
 
 GITHUB_API = "https://api.github.com"
-MAX_FILES = 20
-MAX_TOTAL_BYTES = 120 * 1024  # 120 KB
+MAX_FILES = 35
+MAX_TOTAL_BYTES = 200 * 1024  # 200 KB
 MAX_FILE_BYTES = 50 * 1024    # 50 KB per file
 
-EXACT_MEANINGFUL = {
+# Filenames matched regardless of directory
+EXACT_MEANINGFUL = frozenset([
     "README.md", "README.rst", "README",
-    "package.json",
     "requirements.txt", "Pipfile",
     "pyproject.toml", "setup.py", "setup.cfg",
+    "package.json",
     "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
     "compose.yaml", "compose.yml",
     "Makefile",
     "main.py", "app.py", "server.py", "wsgi.py", "asgi.py",
+    "index.html",
     "index.js", "app.js", "server.js",
     ".env.example", ".env.sample",
-    "go.mod", "Cargo.toml",
+    "go.mod", "go.sum", "Cargo.toml",
     "pom.xml", "build.gradle", "build.gradle.kts",
     "tsconfig.json",
     "next.config.js", "next.config.ts",
     "vite.config.js", "vite.config.ts",
     "nginx.conf",
-}
+])
 
-# Higher index = lower priority
-PRIORITY_ORDER = [
-    "README.md", "README.rst", "README",
-    "main.py", "app.py", "server.py",
-    "index.js", "app.js", "server.js",
-    "requirements.txt", "package.json",
-    "pyproject.toml", "setup.py",
-    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
-    "Makefile", ".env.example",
+# Directories that are never meaningful
+SKIP_DIRS = frozenset([
+    "node_modules", ".venv", "venv", "__pycache__", ".git",
+    "dist", "build", ".next", ".nuxt", "coverage",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "vendor", "bower_components", ".yarn",
+])
+
+# File extensions that are never meaningful (binary, media, compiled)
+SKIP_EXTENSIONS = frozenset([
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp", ".tiff",
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".wasm",
+    ".exe", ".dll", ".so", ".dylib", ".a", ".lib",
+    ".pyc", ".pyo", ".class", ".o",
+    ".mp4", ".mp3", ".avi", ".mov",
+    ".pdf",
+    ".map",  # source maps
+])
+
+# Exact filenames to skip (lock files, legal, meta)
+SKIP_FILENAMES = frozenset([
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+    "Pipfile.lock", "poetry.lock", "composer.lock", "Cargo.lock",
+    "LICENSE", "LICENSE.md", "LICENSE.txt", "LICENCE", "LICENCE.md",
+    ".gitignore", ".gitattributes", ".editorconfig",
+    "CHANGELOG.md", "CHANGELOG.rst", "CHANGELOG.txt",
+])
+
+# Priority scores — lower = fetched first.
+# Keyed by full path OR bare filename (full path checked first).
+_PRIORITY: list[tuple[str, int]] = [
+    # Project overview
+    ("README.md", 0), ("README.rst", 0), ("README", 0),
+    (".env.example", 1), (".env.sample", 1),
+    # Dependency manifests
+    ("requirements.txt", 10), ("pyproject.toml", 11),
+    ("package.json", 12), ("Pipfile", 13), ("go.mod", 14), ("Cargo.toml", 15),
+    # Container / orchestration
+    ("Dockerfile", 20), ("docker-compose.yml", 21), ("docker-compose.yaml", 21),
+    ("compose.yaml", 22), ("compose.yml", 22),
+    # Build / task runner
+    ("Makefile", 30),
+    # Known entry points by full path (highest specificity)
+    ("backend/main.py", 40), ("backend/app.py", 41), ("backend/server.py", 42),
+    ("backend/analyzer.py", 43), ("backend/github_client.py", 44),
+    ("frontend/index.html", 50), ("frontend/script.js", 51), ("frontend/styles.css", 52),
+    # Common entry points by bare filename (fallback)
+    ("main.py", 45), ("app.py", 46), ("server.py", 47),
+    ("index.html", 53), ("index.js", 55), ("app.js", 56), ("server.js", 57),
+    # Config
+    ("tsconfig.json", 60), ("nginx.conf", 61),
+    ("next.config.js", 62), ("next.config.ts", 62),
+    ("vite.config.js", 63), ("vite.config.ts", 63),
 ]
+_PRIORITY_MAP: dict[str, int] = {k: v for k, v in _PRIORITY}
 
 
 class GitHubError(Exception):
@@ -63,23 +110,76 @@ def parse_repo_url(url: str) -> tuple[str, str]:
 
 
 def is_meaningful(path: str) -> bool:
-    filename = path.split("/")[-1]
+    parts = path.split("/")
+    filename = parts[-1]
 
+    # ── Exclusions (evaluated first, cheapest exit) ──────────────────────
+
+    # Any segment of the path is a known skip directory
+    if any(part in SKIP_DIRS for part in parts[:-1]):
+        return False
+
+    # Extension-based exclusion
+    dot = filename.rfind(".")
+    ext = filename[dot:].lower() if dot > 0 else ""
+    if ext in SKIP_EXTENSIONS:
+        return False
+
+    # Minified bundles
+    if ".min." in filename:
+        return False
+
+    # Exact filename exclusions (lock files, legal, meta)
+    if filename in SKIP_FILENAMES:
+        return False
+
+    # ── Inclusions ────────────────────────────────────────────────────────
+
+    # Exact filename match
     if filename in EXACT_MEANINGFUL:
         return True
 
-    if path.startswith(".github/workflows/") and filename.endswith((".yml", ".yaml")):
+    # CI workflows
+    if path.startswith(".github/workflows/") and ext in (".yml", ".yaml"):
         return True
 
-    if filename.endswith(".tf"):
+    # Terraform
+    if ext == ".tf":
         return True
 
+    # Kubernetes / Helm / infra YAML
     infra_prefixes = (
         "k8s/", "kubernetes/", "helm/", "manifests/",
         "deploy/", "deployment/", "chart/", "charts/",
     )
-    if any(path.startswith(p) for p in infra_prefixes) and filename.endswith((".yml", ".yaml")):
+    if any(path.startswith(p) for p in infra_prefixes) and ext in (".yml", ".yaml"):
         return True
+
+    # Python source under common backend dirs, or at repo root
+    if ext == ".py":
+        if len(parts) == 1:
+            return True
+        top = parts[0]
+        if top in ("backend", "app", "src", "api", "core", "lib",
+                   "services", "utils", "models", "routes", "handlers", "middleware"):
+            return True
+        # Test files anywhere outside excluded dirs (already filtered above)
+        if filename.startswith("test_") or filename.endswith("_test.py"):
+            return True
+        if "tests" in parts or "test" in parts:
+            return True
+
+    # JavaScript / TypeScript under frontend or common source dirs (max depth 3)
+    if ext in (".js", ".ts", ".jsx", ".tsx"):
+        top = parts[0]
+        if top in ("frontend", "src", "client", "web", "ui") and len(parts) <= 3:
+            return True
+
+    # CSS / SCSS under frontend or style dirs
+    if ext in (".css", ".scss", ".sass"):
+        top = parts[0]
+        if top in ("frontend", "src", "client", "web", "ui", "styles", "css"):
+            return True
 
     return False
 
@@ -170,11 +270,26 @@ class GitHubClient:
         candidates = [item for item in tree if is_meaningful(item["path"])]
 
         def priority(item: dict) -> int:
-            name = item["path"].split("/")[-1]
-            try:
-                return PRIORITY_ORDER.index(name)
-            except ValueError:
-                return len(PRIORITY_ORDER)
+            path = item["path"]
+            filename = path.split("/")[-1]
+            # Full path wins over bare filename for specificity
+            if path in _PRIORITY_MAP:
+                return _PRIORITY_MAP[path]
+            if filename in _PRIORITY_MAP:
+                return _PRIORITY_MAP[filename]
+            # CI workflows
+            if path.startswith(".github/workflows/"):
+                return 70
+            # Test files
+            if filename.startswith("test_") or filename.endswith("_test.py") or \
+               "tests/" in path or "/test/" in path:
+                return 75
+            # Other Python / JS / TS source
+            dot = filename.rfind(".")
+            ext = filename[dot:].lower() if dot > 0 else ""
+            if ext in (".py", ".js", ".ts", ".jsx", ".tsx", ".css", ".scss"):
+                return 80
+            return 90
 
         candidates.sort(key=priority)
         return candidates[:MAX_FILES]

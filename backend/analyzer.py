@@ -72,7 +72,7 @@ Return ONLY a valid JSON object. No markdown, no code fences, no text outside th
   "improvement_suggestions": [
     "[specific file] — [exact change to make and why]"
   ],
-  "important_files": ["path/to/file1", "path/to/file2"]
+  "important_files": ["list every file path from the FILE CONTENTS section above — all provided files were part of this analysis"]
 }"""
 
 
